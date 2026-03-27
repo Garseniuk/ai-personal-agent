@@ -95,7 +95,7 @@ async def process_llm_response(response_text: str, message: types.Message, proce
             analysis_prompt = f"Odpowiedz na pytanie użytkownika: '{user_question}'.\n\nMasz do dyspozycji poniższe dane z bazy SQLite:\n{db_data}\n\nNapisz naturalną, zwięzłą odpowiedź. Podsumuj kwoty, jeśli trzeba."
             
             summary_response = await model.generate_content_async(analysis_prompt)
-            await processing_msg.edit_text(f"📊 **Analiza:**\n\n{summary_response.text}", parse_mode="Markdown")
+            await processing_msg.edit_text(f"📊 Analiza:\n\n{summary_response.text}")
             
         else:
             reply_text = f"Zinterpretowane dane:\n```json\n{json.dumps(parsed_data, indent=2, ensure_ascii=False)}\n```"
@@ -121,10 +121,19 @@ async def handle_voice(message: types.Message):
         file = await bot.get_file(message.voice.file_id)
         await bot.download_file(file.file_path, destination=local_filename)
         
-        audio_file = genai.upload_file(path=local_filename)
+        # Odczytujemy plik audio jako surowe dane (bajty) - najszybsza metoda
+        with open(local_filename, "rb") as f:
+            audio_bytes = f.read()
+            
+        audio_data = {
+            "mime_type": "audio/ogg",
+            "data": audio_bytes
+        }
+        
         full_prompt = f"{SYSTEM_PROMPT}\n\nPrzeanalizuj dołączone nagranie głosowe."
         
-        response = await model.generate_content_async([full_prompt, audio_file])
+        # Wysyłamy tekst i dane audio bezpośrednio do modelu w jednej paczce
+        response = await model.generate_content_async([full_prompt, audio_data])
         await process_llm_response(response.text, message, processing_msg)
             
     except Exception as e:
