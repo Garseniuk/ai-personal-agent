@@ -24,14 +24,15 @@ genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-2.5-flash')
 
 SYSTEM_PROMPT = """
-Jesteś asystentem osobistym. Przeanalizuj wiadomość użytkownika (tekstową lub głosową) i sklasyfikuj ją do jednej z kategorii: "wydatek", "zadanie", "notatka".
+Jesteś asystentem osobistym. Przeanalizuj wiadomość użytkownika (tekstową lub głosową) i sklasyfikuj ją.
+Kategorie do wyboru: "wydatek", "zadanie", "notatka", "zapytanie_o_dane".
 Zwróć wynik TYLKO w formacie czystego JSON.
 Struktura JSON:
 {
-  "kategoria": "wydatek/zadanie/notatka",
+  "kategoria": "wydatek/zadanie/notatka/zapytanie_o_dane",
   "kwota": null (jeśli wydatek, podaj liczbę),
   "waluta": "PLN",
-  "opis": "krótki opis",
+  "opis": "krótki opis lub treść pytania",
   "czy_wymaga_akcji": true/false
 }
 """
@@ -51,15 +52,29 @@ def init_db():
         ''')
         conn.commit()
 
+def get_recent_expenses():
+    """Fetches the latest expenses from the database for LLM context."""
+    with sqlite3.connect('agent.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT kwota, waluta, opis, data_dodania FROM wydatki ORDER BY data_dodania DESC LIMIT 50")
+        rows = cursor.fetchall()
+        
+        if not rows:
+            return "Brak danych w bazie."
+            
+        context = "Historia wydatków:\n"
+        for row in rows:
+            context += f"- {row[0]} {row[1]} | Cel: {row[2]} | Data: {row[3]}\n"
+        return context
+
 async def process_llm_response(response_text: str, message: types.Message, processing_msg: types.Message):
-    """Parses LLM output, saves expenses to DB, and sends formatted reply."""
+    """Parses LLM output, handles specific intents, and replies."""
     try:
         raw_json = response_text.strip().removeprefix('```json').removesuffix('```').strip()
         parsed_data = json.loads(raw_json)
+        kategoria = parsed_data.get("kategoria")
         
-        reply_text = f"Zinterpretowane dane:\n```json\n{json.dumps(parsed_data, indent=2, ensure_ascii=False)}\n```\n"
-        
-        if parsed_data.get("kategoria") == "wydatek" and parsed_data.get("kwota") is not None:
+        if kategoria == "wydatek" and parsed_data.get("kwota") is not None:
             with sqlite3.connect('agent.db') as conn:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -67,16 +82,31 @@ async def process_llm_response(response_text: str, message: types.Message, proce
                     (parsed_data["kwota"], parsed_data.get("waluta", "PLN"), parsed_data["opis"], datetime.now())
                 )
                 conn.commit()
-            reply_text += "\n✅ Wydatek zapisany w bazie."
-
-        await processing_msg.edit_text(reply_text, parse_mode="Markdown")
-        
+            
+            reply_text = f"✅ Wydatek zapisany:\n{parsed_data['kwota']} {parsed_data.get('waluta', 'PLN')} na: {parsed_data['opis']}"
+            await processing_msg.edit_text(reply_text)
+            
+        elif kategoria == "zapytanie_o_dane":
+            await processing_msg.edit_text("🔍 Przeszukuję bazę danych i analizuję historię...")
+            
+            user_question = parsed_data.get("opis", "Podsumuj moje wydatki.")
+            db_data = get_recent_expenses()
+            
+            analysis_prompt = f"Odpowiedz na pytanie użytkownika: '{user_question}'.\n\nMasz do dyspozycji poniższe dane z bazy SQLite:\n{db_data}\n\nNapisz naturalną, zwięzłą odpowiedź. Podsumuj kwoty, jeśli trzeba."
+            
+            summary_response = await model.generate_content_async(analysis_prompt)
+            await processing_msg.edit_text(f"📊 **Analiza:**\n\n{summary_response.text}", parse_mode="Markdown")
+            
+        else:
+            reply_text = f"Zinterpretowane dane:\n```json\n{json.dumps(parsed_data, indent=2, ensure_ascii=False)}\n```"
+            await processing_msg.edit_text(reply_text, parse_mode="Markdown")
+            
     except json.JSONDecodeError:
         logging.error(f"Failed to parse JSON from LLM: {response_text}")
         await processing_msg.edit_text("❌ Model zwrócił nieprawidłowy format danych.")
     except Exception as e:
         logging.error(f"Error processing response: {e}")
-        await processing_msg.edit_text("❌ Wystąpił błąd podczas zapisywania danych.")
+        await processing_msg.edit_text("❌ Wystąpił błąd podczas obsługi danych.")
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -101,7 +131,6 @@ async def handle_voice(message: types.Message):
         logging.error(f"Voice handling error: {e}")
         await processing_msg.edit_text("❌ Błąd przetwarzania głosu.")
     finally:
-        # Zawsze sprzątamy pliki z dysku, nawet jak wystąpi błąd
         if os.path.exists(local_filename):
             os.remove(local_filename)
 
